@@ -161,11 +161,40 @@ class RNN_ENCODER(nn.Module):
         sent_emb = sent_emb.view(-1, self.nhidden * self.num_directions)
         return words_emb, sent_emb
 
-
+class CNN_dummy(nn.Module):
+    def __init__(self):
+        super(CNN_dummy, self).__init__()
+        self.ds1 = nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=0)
+        self.middle1 = nn.Conv2d(32,32,3,1)
+        self.middle2 = nn.Conv2d(32,192, 3,1)
+        self.ds2 = nn.Conv2d(192, 768, 3,2)
+        self.ds3 = nn.Conv2d(768, 2048, 3,2)
+        self.emb_cnn_code = conv1x1(2048, 256)
+     
+    def forward(self, x):
+        x = nn.Upsample(size=(299, 299), mode='bilinear')(x)
+        x = self.ds1(x)
+        ##149 x 149 x 32
+        x = self.middle1(x)
+        ##147x 147 x 32
+        x = F.max_pool2d(x, kernel_size=3, stride=2)
+        ## 73 x 73 x 32
+        x = self.middle2(x)
+        ## 71 x 71 x 192
+        x = F.max_pool2d(x, kernel_size=3, stride=2)
+        ##35 x 35 x 192
+        x = self.ds2(x)
+        ## 17 x 17 x 768
+        x = self.ds3(x)
+        ## 8x8x2048
+        x = self.emb_cnn_code(x)
+        ## 8x8x256
+        return x
+        
 class CNN_ENCODER(nn.Module):
     def __init__(self):
         super(CNN_ENCODER, self).__init__()
-
+        self.nef = 256
         model = models.inception_v3()
         url = 'https://download.pytorch.org/models/inception_v3_google-1a9a5a14.pth'
         model.load_state_dict(model_zoo.load_url(url))
@@ -197,6 +226,8 @@ class CNN_ENCODER(nn.Module):
 
         #self.emb_features = conv1x1(768, self.nef)
         #self.emb_cnn_code = nn.Linear(2048, self.nef)
+        self.emb_cnn_code = conv1x1(2048, self.nef)
+
 
     def init_trainable_weights(self):
         initrange = 0.1
@@ -259,7 +290,8 @@ class CNN_ENCODER(nn.Module):
         # 2048
 
         # global image features
-        #cnn_code = self.emb_cnn_code(x)
+        x = self.emb_cnn_code(x)
+        ## 8 x 8 x 256
         # 512
         #if features is not None:
         #    features = self.emb_features(features)
@@ -270,14 +302,14 @@ class CNN_ENCODER(nn.Module):
 class Att_Classifier(nn.Module):
     def __init__(self):
         super().__init__()
-        inplanes = 2048
-        self.outplanes = 1024
+        inplanes = 256
+        self.outplanes = 128
         self.conv1 = conv1x1(inplanes, self.outplanes)
         self.fc = nn.Linear(self.outplanes, 1)
         self.sigmoid = nn.Sigmoid()
         
     def forward(self, x):
-        ### x: batch x 2048 x 8 x 8
+        ### x: batch x 256 x 8 x 8
         x = self.conv1(x)
         x = F.avg_pool2d(x, kernel_size=8)
         embedding = x.view(-1, self.outplanes)
@@ -491,61 +523,74 @@ class G_NET(nn.Module):
 
         return fake_imgs, mu, logvar
 
-class G_NET_not_CA(nn.Module):
+class G_NET_not_CA_stage1(nn.Module):
     def __init__(self, args):
-        super(G_NET_not_CA, self).__init__()
+        super(G_NET_not_CA_stage1, self).__init__()
         ngf = cfg.GAN.GF_DIM
         nef = 312
         ncf = cfg.GAN.CONDITION_DIM
         self.args = args
-        self.ca_net = CA_NET()
 
-        if cfg.TREE.BRANCH_NUM > 0:
-            self.h_net1 = INIT_STAGE_G_not_CA(ngf * 16, nef)
-            self.img_net1 = GET_IMAGE_G(ngf)
+        self.h_net1 = INIT_STAGE_G_not_CA(ngf * 16, nef)
+        self.img_net1 = GET_IMAGE_G(ngf)
         # gf x 64 x 64
-        if cfg.TREE.BRANCH_NUM > 1:
-            self.h_net2 = NEXT_STAGE_G(ngf, nef, ncf)
-            self.img_net2 = GET_IMAGE_G(ngf)
-        if cfg.TREE.BRANCH_NUM > 2:
-            self.h_net3 = NEXT_STAGE_G(ngf, nef, ncf)
-            self.img_net3 = GET_IMAGE_G(ngf)
-
-    def forward(self, z_code, atts, image_atts, inception_model, classifiers, 
-                    real_imgs=None, errG_total=None):
+    
+    def forward(self, z_code, atts, image_atts):
         """
             :param z_code: batch x cfg.GAN.Z_DIM
             :param ett_embeddings: batch x 312 x 1024
             :return:
         """
-        fake_imgs = []
+        h_code1 = self.h_net1(z_code, atts, image_atts)
+        fake_img1 = self.img_net1(h_code1)
 
-        if cfg.TREE.BRANCH_NUM > 0:
-            h_code1 = self.h_net1(z_code, atts, image_atts)
-            fake_img1 = self.img_net1(h_code1)
-            if self.args.split=='train': 
-                att_embeddings, C_losses = classifier_loss(classifiers, inception_model, real_imgs[0], image_atts)
-                _, C_losses = classifier_loss(classifiers, inception_model, fake_img1, image_atts, C_losses)
-            else:
-                att_embeddings, _ = classifier_loss(classifiers, inception_model, fake_img1, image_atts)
-            fake_imgs.append(fake_img1)
+        return fake_img1, h_code1
 
-        if cfg.TREE.BRANCH_NUM > 1:
-            h_code2 = self.h_net2(h_code1, att_embeddings) 
-            fake_img2 = self.img_net2(h_code2)
-            if self.args.split=='train': 
-                att_embeddings, C_losses= classifier_loss(classifiers, inception_model, real_imgs[1], image_atts, C_losses)
-                _, C_losses= classifier_loss(classifiers, inception_model, fake_img2, image_atts, C_losses)
-            else:
-                att_embeddings, _ = classifier_loss(classifiers, inception_model, fake_img2, image_atts)
-            fake_imgs.append(fake_img2)
 
-        if cfg.TREE.BRANCH_NUM > 2:
-            h_code3 = self.h_net3(h_code2, att_embeddings)
-            fake_img3 = self.img_net3(h_code3)
-            fake_imgs.append(fake_img3)
+class G_NET_not_CA_stage2(nn.Module):
+    def __init__(self, args):
+        super(G_NET_not_CA_stage2, self).__init__()
+        ngf = cfg.GAN.GF_DIM
+        nef = 312
+        ncf = cfg.GAN.CONDITION_DIM
+        self.args = args
 
-        return fake_imgs, C_losses
+        self.h_net2 = NEXT_STAGE_G(ngf, nef, ncf)
+        self.img_net2 = GET_IMAGE_G(ngf)
+
+    def forward(self, h_code1, att_embeddings):
+        """
+            :param ett_embeddings: batch x 312 x 1024
+            :return:
+        """
+
+        h_code2 = self.h_net2(h_code1, att_embeddings) 
+        fake_img2 = self.img_net2(h_code2)
+
+        return fake_img2, h_code2
+
+
+class G_NET_not_CA_stage3(nn.Module):
+    def __init__(self, args):
+        super(G_NET_not_CA_stage3, self).__init__()
+        ngf = cfg.GAN.GF_DIM
+        nef = 312
+        ncf = cfg.GAN.CONDITION_DIM
+        self.args = args
+
+        self.h_net3 = NEXT_STAGE_G(ngf, nef, ncf)
+        self.img_net3 = GET_IMAGE_G(ngf)
+
+    def forward(self, h_code2, att_embeddings):
+        """
+            :param ett_embeddings: batch x 312 x 1024
+            :return:
+        """
+        h_code3 = self.h_net3(h_code2, att_embeddings)
+        fake_img3 = self.img_net3(h_code3)
+
+        return fake_img3
+
 
 
 

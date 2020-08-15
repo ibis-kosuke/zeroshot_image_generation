@@ -124,7 +124,7 @@ class Att_Attention_Net(nn.Module):
     def __init__(self, ngf):
         super(Att_Attention_Net, self).__init__()
         self.ngf = ngf
-        self.att_emb = nn.Linear(1024, ngf)
+        self.att_emb = nn.Linear(128, ngf)
 
     def forward(self, h_code, att_embeddings):
         batch_size = h_code.shape[0]

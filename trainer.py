@@ -14,12 +14,14 @@ from miscc.config import cfg
 from miscc.utils import mkdir_p
 from miscc.utils import build_super_images, build_super_images2, build_images
 from miscc.utils import weights_init, load_params, copy_G_params
-from model import G_DCGAN, G_NET, G_NET_not_CA, Att_Classifier
+from model import G_DCGAN, G_NET, G_NET_not_CA, Att_Classifier, G_NET_not_CA_stage1, G_NET_not_CA_stage2, G_NET_not_CA_stage3
+from model import CNN_dummy
 from datasets import prepare_data
 from model import RNN_ENCODER, CNN_ENCODER
 
 from miscc.losses import words_loss
-from miscc.losses import discriminator_loss, generator_loss, KL_loss
+from miscc.losses import discriminator_loss, generator_loss, KL_loss 
+from miscc.losses import classifier_loss
 import os
 import time
 import numpy as np
@@ -61,6 +63,7 @@ class condGANTrainer(object):
     def build_models(self):
         ##feature extractor
         inception_model = CNN_ENCODER()
+        #inception_model = CNN_dummy()
 
         ## classifier networks
         classifiers = []
@@ -69,6 +72,7 @@ class condGANTrainer(object):
             classifiers.append(cls_model)
 
         # #######################generator and discriminators############## #
+        netsG = []
         netsD = []
         if cfg.GAN.B_DCGAN:
             if cfg.TREE.BRANCH_NUM ==1:
@@ -82,18 +86,24 @@ class condGANTrainer(object):
             netsD = [D_NET(b_jcu=False)]
         else:
             from model import D_NET64, D_NET128, D_NET256
+            """
             if not self.args.kl_loss:
                 netG = G_NET_not_CA(self.args) 
             else:
                 netG = G_NET()
+            """
             if cfg.TREE.BRANCH_NUM > 0:
                 netsD.append(D_NET64())
+                netsG.append(G_NET_not_CA_stage1(self.args))
             if cfg.TREE.BRANCH_NUM > 1:
                 netsD.append(D_NET128())
+                netsG.append(G_NET_not_CA_stage2(self.args))
             if cfg.TREE.BRANCH_NUM > 2:
                 netsD.append(D_NET256())
+                netsG.append(G_NET_not_CA_stage3(self.args))
             # TODO: if cfg.TREE.BRANCH_NUM > 3:
-        netG.apply(weights_init)
+        for i in range(len(netsG)):
+            netsG[i].apply(weights_init)
         # print(netG)
         for i in range(len(netsD)):
             netsD[i].apply(weights_init)
@@ -121,16 +131,16 @@ class condGANTrainer(object):
                     netsD[i].load_state_dict(state_dict)
         # ########################################################### #
         if cfg.CUDA:
-            netG.cuda()
             inception_model.cuda()
-            for i in range(len(netsD)):
+            for i in range(len(netsG)):
+                netsG[i].cuda()
                 netsD[i].cuda()
             for i in range(len(classifiers)):
                 classifiers[i].cuda()
     
-        return [netG, netsD, inception_model, classifiers, epoch]
+        return [netsG, netsD, inception_model, classifiers, epoch]
 
-    def define_optimizers(self, netG, netsD, classifiers):
+    def define_optimizers(self, netsG, netsD, classifiers):
         optimizersC = []
         for i in range(len(classifiers)):
             opt = optim.Adam(classifiers[i].parameters(), lr=cfg.TRAIN.C_LR,
@@ -144,12 +154,14 @@ class condGANTrainer(object):
                              lr=cfg.TRAIN.DISCRIMINATOR_LR,
                              betas=(0.5, 0.999))
             optimizersD.append(opt)
-
-        optimizerG = optim.Adam(netG.parameters(),
-                                lr=cfg.TRAIN.GENERATOR_LR,
-                                betas=(0.5, 0.999))
+        optimizersG = []
+        for i in range(len(netsG)):
+            opt = optim.Adam(netsG[i].parameters(),
+                                    lr=cfg.TRAIN.GENERATOR_LR,
+                                    betas=(0.5, 0.999))
+            optimizersG.append(opt)
             
-        return optimizerG, optimizersD, optimizersC
+        return optimizersG, optimizersD, optimizersC
 
     def prepare_labels(self):
         batch_size = self.batch_size
@@ -161,7 +173,7 @@ class condGANTrainer(object):
 
         return real_labels, fake_labels
 
-    def save_model(self, netG, avg_param_G, netsD, classifiers, epoch):
+    def save_model(self, netsG, avg_params_G, netsD, classifiers, epoch):
         mkdir_p(self.model_dir)
 
         for i in range(len(classifiers)):
@@ -169,17 +181,19 @@ class condGANTrainer(object):
             torch.save(classifier.state_dict(), 
                         '%s/classifier_%d.pth' %(self.model_dir, i))
 
-        backup_para = copy_G_params(netG)
-        load_params(netG, avg_param_G)
-        torch.save(netG.state_dict(),
-            '%s/netG_epoch_%d.pth' % (self.model_dir, epoch))
-        load_params(netG, backup_para)
+        for i in range(len(netsG)):
+            backup_para = copy_G_params(netsG[i])
+            load_params(netsG[i], avg_params_G[i])
+            torch.save(netsG[i].state_dict(),
+                '%s/netsG%d_epoch_%d.pth' % (self.model_dir, i, epoch))
+            load_params(netsG[i], backup_para)
         #
         for i in range(len(netsD)):
             netD = netsD[i]
             torch.save(netD.state_dict(),
                 '%s/netD%d.pth' % (self.model_dir, i))
-        print('Save G/Ds/classifiers models.')
+
+        print('Save Gs/Ds/classifiers models.')
 
     def set_requires_grad_value(self, models_list, brequires):
         for i in range(len(models_list)):
@@ -187,14 +201,42 @@ class condGANTrainer(object):
                 p.requires_grad = brequires
 
 
-    def save_img_results(self, netG, noise, atts, image_att, inception_model, classifiers, imgs, gen_iterations, name='current'):
+    def save_img_results(self, netsG, noise, atts, image_atts, inception_model, classifiers, 
+                            real_imgs, gen_iterations, name='current'):
         mkdir_p(self.image_dir)
 
         # Save images
+        """
         if self.args.kl_loss:
             fake_imgs, _, _ = netG(noise, atts) ##
         else:
             fake_imgs, _  = netG(noise, atts, image_att, inception_model, classifiers, imgs)
+        """
+
+        fake_imgs = []
+        C_losses = None
+        if not self.args.kl_loss:
+            if cfg.TREE.BRANCH_NUM > 0:
+                fake_img1, h_code1 = nn.parallel.data_parallel( netsG[0], (noise, atts, image_atts), self.gpus)
+                fake_imgs.append(fake_img1)
+                if self.args.split=='train': ##for train: real_imgsの特徴量を使う。
+                    att_embeddings, C_losses = classifier_loss(classifiers, inception_model, real_imgs[0], image_atts, C_losses)
+                    _, C_losses = classifier_loss(classifiers, inception_model, fake_img1, image_atts, C_losses)
+                else:##いらない
+                    att_embeddings, _ = classifier_loss(classifiers, inception_model, fake_img1, image_atts)
+
+            if cfg.TREE.BRANCH_NUM > 1:
+                fake_img2, h_code2 =  nn.parallel.data_parallel( netsG[1], (h_code1, att_embeddings), self.gpus)
+                fake_imgs.append(fake_img2)
+                if self.args.split=='train': 
+                    att_embeddings, C_losses = classifier_loss(classifiers, inception_model, real_imgs[1], image_atts, C_losses)
+                    _, C_losses = classifier_loss(classifiers, inception_model, fake_img1, image_atts, C_losses)
+                else:
+                    att_embeddings, _ = classifier_loss(classifiers, inception_model, fake_img1, image_atts)
+                        
+            if cfg.TREE.BRANCH_NUM > 2:
+                fake_img3 = nn.parallel.data_parallel( netsG[2], (h_code2, att_embeddings) ,self.gpus)
+                fake_imgs.append(fake_img3)
 
         ##make image set
         img_set = build_images(fake_imgs)##
@@ -204,9 +246,11 @@ class condGANTrainer(object):
 
 
     def train(self):
-        netG, netsD, inception_model, classifiers, start_epoch = self.build_models()
-        avg_param_G = copy_G_params(netG)
-        optimizerG, optimizersD, optimizersC = self.define_optimizers(netG, netsD, classifiers)
+        netsG, netsD, inception_model, classifiers, start_epoch = self.build_models()
+        avg_params_G=[]
+        for i in range(len(netsG)):
+            avg_params_G.append(copy_G_params(netsG[i]))
+        optimizersG, optimizersD, optimizersC = self.define_optimizers(netsG, netsD, classifiers)
         real_labels, fake_labels= self.prepare_labels()
         writer = SummaryWriter(self.args.run_dir)
 
@@ -226,8 +270,11 @@ class condGANTrainer(object):
             data_iter = iter(self.data_loader)
             step = 0
             while step < self.num_batches:
+                print("step:{}/{} {:.2f}%".format(step, self.num_batches, step/self.num_batches*100))
+                """
                 if(step%self.display_interval==0):
                     print("step:{}/{} {:.2f}%".format(step, self.num_batches, step/self.num_batches*100))
+                """
                 # reset requires_grad to be trainable for all Ds
                 # self.set_requires_grad_value(netsD, True)
 
@@ -235,13 +282,39 @@ class condGANTrainer(object):
                 # (1) Prepare training data and Compute text embeddings
                 ######################################################
                 data = data_iter.next()
-                imgs, atts, image_atts, class_ids, keys = prepare_data(data)
+                real_imgs, atts, image_atts, class_ids, keys = prepare_data(data)
 
                 #######################################################
                 # (2) Generate fake images
                 ######################################################
                 noise.data.normal_(0, 1)
-                
+
+                print("before netG")
+                fake_imgs = []
+                C_losses = None
+                if not self.args.kl_loss:
+                    if cfg.TREE.BRANCH_NUM > 0:
+                        fake_img1, h_code1 = nn.parallel.data_parallel( netsG[0], (noise, atts, image_atts), self.gpus)
+                        fake_imgs.append(fake_img1)
+                        if self.args.split=='train': ##for train: 
+                            att_embeddings, C_losses = classifier_loss(classifiers, inception_model, real_imgs[0], image_atts, C_losses)
+                            _, C_losses = classifier_loss(classifiers, inception_model, fake_img1, image_atts, C_losses)
+                        else:
+                            att_embeddings, _ = classifier_loss(classifiers, inception_model, fake_img1, image_atts)
+
+                    if cfg.TREE.BRANCH_NUM > 1:
+                        fake_img2, h_code2 =  nn.parallel.data_parallel( netsG[1], (h_code1, att_embeddings), self.gpus)
+                        fake_imgs.append(fake_img2)
+                        if self.args.split=='train': 
+                            att_embeddings, C_losses = classifier_loss(classifiers, inception_model, real_imgs[1], image_atts, C_losses)
+                            _, C_losses = classifier_loss(classifiers, inception_model, fake_img1, image_atts, C_losses)
+                        else:
+                            att_embeddings, _ = classifier_loss(classifiers, inception_model, fake_img1, image_atts)
+                        
+                    if cfg.TREE.BRANCH_NUM > 2:
+                        fake_img3 = nn.parallel.data_parallel( netsG[2], (h_code2, att_embeddings), self.gpus)
+                        fake_imgs.append(fake_img3)
+                print("end netG")
 
                 """
                 if not self.args.kl_loss:
@@ -260,7 +333,7 @@ class condGANTrainer(object):
                 errD_dic={}
                 for i in range(len(netsD)):
                     netsD[i].zero_grad()
-                    errD = discriminator_loss(netsD[i], imgs[i], fake_imgs[i],
+                    errD = discriminator_loss(netsD[i], real_imgs[i], fake_imgs[i],
                                               atts, real_labels, fake_labels)
                     # backward and update parameters
                     errD.backward()
@@ -278,19 +351,25 @@ class condGANTrainer(object):
 
                 # do not need to compute gradient for Ds
                 # self.set_requires_grad_value(netsD, False)
-                netG.zero_grad()
+                for i in range(len(netsG)):
+                    netsG[i].zero_grad()
+                print("before c backward")
                 errC_total = 0
                 C_logs = ''
                 for i in range(len(classifiers)):
                     classifiers[i].zero_grad()
-                    C_losses[i].backward()
+                    C_losses[i].backward(retain_graph=True)
                     optimizersC[i].step()
                     errC_total += C_losses[i]
                 C_logs += 'errC_total: %.2f ' % ( errC_total.item())
+                print("end c backward")
 
-                for i in range(netG.parameters()):
+                """
+                for i,param in enumerate(netsG[0].parameters()):
                     if i==0:
-                        print(netG.parameters()[i].grad)
+                        print(param.grad)
+                """
+                
 
                  ##TODO netGにgradientが溜まっているかどうかを確認せよ。
 
@@ -305,30 +384,36 @@ class condGANTrainer(object):
                 
                 # backward and update parameters
                 errG_total.backward()
-                optimizerG.step()
+                for i in range(len(optimizersG)):
+                    optimizersG[i].step()
                 for i in range(len(optimizersC)):
                     optimizersC[i].step()
 
                 errD_dic.update(errG_dic)
                 writer.add_scalars('training_losses', errD_dic, epoch*self.num_batches+step)
 
-                """ 
-                self.save_img_results(netG, fixed_noise, atts,image_atts,
-                                          epoch, name='average') ##for debug
                 """
-                                          
-                for p, avg_p in zip(netG.parameters(), avg_param_G):
-                    avg_p.mul_(0.999).add_(0.001, p.data)
+                self.save_img_results(netsG, fixed_noise, atts, image_atts, inception_model, 
+                             classifiers, real_imgs, epoch, name='average') ##for debug
+                """
+            
+                for i in range(len(netsG)):                                          
+                    for p, avg_p in zip(netsG[i].parameters(), avg_params_G[i]):
+                        avg_p.mul_(0.999).add_(0.001, p.data)
 
                 if gen_iterations % 100 == 0:
                     print(D_logs + '\n' + G_logs +'\n' + C_logs)
                 # save images
                 if gen_iterations % 1000 == 0:
-                    backup_para = copy_G_params(netG)
-                    load_params(netG, avg_param_G)
-                    self.save_img_results(netG, fixed_noise, atts, image_atts, inception_model, classifiers, imgs,
+                    backup_paras = []
+                    for i in range(len(netsG)):
+                        backup_para = copy_G_params(netsG[i])
+                        backup_paras.append(backup_para)
+                        load_params(netsG[i], avg_params_G[i])
+                    self.save_img_results(netsG, fixed_noise, atts, image_atts, inception_model, classifiers, imgs,
                                           epoch, name='average')
-                    load_params(netG, backup_para)
+                    for i in raneg(len(netsG)):
+                        load_params(netsG[i], backup_paras[i])
                     #
                     # self.save_img_results(netG, fixed_noise, sent_emb,
                     #                       words_embs, mask, image_encoder,
@@ -343,9 +428,9 @@ class condGANTrainer(object):
                      end_t - start_t))
 
             if epoch % cfg.TRAIN.SNAPSHOT_INTERVAL == 0:  # and epoch != 0:
-                self.save_model(netG, avg_param_G, netsD, classifiers, epoch)
+                self.save_model(netsG, avg_params_G, netsD, classifiers, epoch)
 
-        self.save_model(netG, avg_param_G, netsD, classifiers, self.max_epoch)
+        self.save_model(netsG, avg_params_G, netsD, classifiers, self.max_epoch)
 
 
     def save_singleimages(self, images, filenames, save_dir,

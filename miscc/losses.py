@@ -201,7 +201,7 @@ def classifier_loss(classifiers, inception_model, imgs, image_atts, C_losses=Non
         else:
             C_losses[j] += loss
     att_embeddings = torch.stack(att_embeddings, dim=1)
-    assert att_embeddings.shape== (target.shape[0], 312, 1024)
+    assert att_embeddings.shape== (target.shape[0], 312, 128)
     return att_embeddings, C_losses
 
 ##################################################################
